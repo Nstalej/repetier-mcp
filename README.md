@@ -25,28 +25,110 @@ for the **Artillery Sidewinder X1**.
 
 ## 🚀 Quick start
 
-### 1. Install repetier-mcp
+Choose your operating system:
+
+---
+
+### 🪟 Windows
+
+#### Step 1 — Install Python
+
+Download Python 3.10+ from [python.org/downloads](https://www.python.org/downloads/).
+
+> ⚠️ During installation, check **"Add Python to PATH"**.
+
+Verify in PowerShell or CMD:
+```
+python --version
+```
+
+#### Step 2 — Install repetier-mcp
+
+Open PowerShell or CMD:
+
+```powershell
+pip install repetier-mcp
+```
+
+Or with `uv` (recommended — faster, no dependency conflicts):
+
+```powershell
+pip install uv
+uv tool install repetier-mcp
+```
+
+#### Step 3 — Find your printer's COM port
+
+1. Connect the printer via USB
+2. Open **Device Manager** (`Win + X` → Device Manager)
+3. Expand **Ports (COM & LPT)**
+4. Look for something like `USB-SERIAL CH340 (COM3)` or `Silicon Labs CP210x (COM4)`
+5. Note your port number, e.g. `COM3`
+
+> **Sidewinder X1:** uses the CH340 chip. If nothing appears, install the driver from
+> [wch-ic.com/downloads/CH341SER_EXE.html](http://www.wch-ic.com/downloads/CH341SER_EXE.html)
+
+#### Step 4 — Configure Claude Desktop
+
+Open (or create) the config file at:
+```
+C:\Users\YOUR_USERNAME\AppData\Roaming\Claude\claude_desktop_config.json
+```
+
+Add this configuration — replace `COM3` with your actual port:
+
+```json
+{
+  "mcpServers": {
+    "repetier": {
+      "command": "uvx",
+      "args": ["repetier-mcp"],
+      "env": {
+        "REPETIER_MODE":  "serial",
+        "REPETIER_PORT":  "COM3",
+        "REPETIER_BAUD":  "250000",
+        "PRINTER_MODEL":  "sidewinder_x1"
+      }
+    }
+  }
+}
+```
+
+Restart Claude Desktop. 🎉
+
+> **Sidewinder X1:** always use `"REPETIER_BAUD": "250000"`.  
+> If the connection fails, try `"115200"` as a fallback.
+
+---
+
+### 🐧 Linux
+
+#### Step 1 — Install repetier-mcp
 
 ```bash
 pip install repetier-mcp
 # or with uv:
-uv tool install repetier-mcp
+pip install uv && uv tool install repetier-mcp
 ```
 
-### 2. Connect your printer via USB
+#### Step 2 — Serial port permissions
 
-Plug in your printer and find the port:
+Add your user to the `dialout` group, then **log out and back in**:
 
 ```bash
-# Linux / macOS
-ls /dev/ttyUSB* /dev/ttyACM* /dev/cu.usbserial*
-
-# Windows  →  Device Manager → Ports (COM & LPT)
+sudo usermod -a -G dialout $USER
 ```
 
-> **Sidewinder X1 tip:** Use baud rate **250000**, not 115200.
+#### Step 3 — Find your port
 
-### 3. Add to Claude Desktop
+```bash
+ls /dev/ttyUSB* /dev/ttyACM*
+# Typical result: /dev/ttyUSB0
+```
+
+#### Step 4 — Configure Claude Desktop
+
+Edit `~/.config/Claude/claude_desktop_config.json`:
 
 ```json
 {
@@ -66,6 +148,61 @@ ls /dev/ttyUSB* /dev/ttyACM* /dev/cu.usbserial*
 ```
 
 Restart Claude Desktop. 🎉
+
+---
+
+### 🍎 macOS
+
+#### Step 1 — Install repetier-mcp
+
+```bash
+pip install repetier-mcp
+# or with uv (recommended):
+brew install uv && uv tool install repetier-mcp
+```
+
+#### Step 2 — Find your port
+
+```bash
+ls /dev/cu.usbserial* /dev/cu.wchusbserial*
+# Typical result: /dev/cu.usbserial-1420
+```
+
+#### Step 3 — Configure Claude Desktop
+
+Edit `~/Library/Application Support/Claude/claude_desktop_config.json`:
+
+```json
+{
+  "mcpServers": {
+    "repetier": {
+      "command": "uvx",
+      "args": ["repetier-mcp"],
+      "env": {
+        "REPETIER_MODE":  "serial",
+        "REPETIER_PORT":  "/dev/cu.usbserial-1420",
+        "REPETIER_BAUD":  "250000",
+        "PRINTER_MODEL":  "sidewinder_x1"
+      }
+    }
+  }
+}
+```
+
+Restart Claude Desktop. 🎉
+
+---
+
+### 🐛 Troubleshooting (Windows)
+
+| Problem | Solution |
+|---|---|
+| Printer not in Device Manager | Try a different USB cable — many cables are charge-only |
+| CH340 driver missing | Install from [wch-ic.com](http://www.wch-ic.com/downloads/CH341SER_EXE.html) |
+| `uvx` not found | Run `pip install uv`, then reopen PowerShell |
+| `1 Commands Waiting` in Repetier-Host | Wrong baud rate — try `250000` then `115200` |
+| Port busy / access denied | Close Repetier-Host first — it and this MCP can't share the port |
+| Random disconnects during print | Disable USB power management in Device Manager → USB Hubs |
 
 ---
 
@@ -109,16 +246,24 @@ Restart Claude Desktop. 🎉
 
 ## 🔍 Diagnostic knowledge base
 
-Built-in error database for the Artillery Sidewinder X1:
+Built-in error database for the Artillery Sidewinder X1 — **11 error types**:
 
-| Error type            | Key symptoms                                     |
-|-----------------------|--------------------------------------------------|
-| `thermal_runaway`     | THERMAL RUNAWAY, Heating failed, temp sensor     |
-| `layer_shifting`      | Layer shift, skipped steps, position lost        |
-| `z_offset_drift`      | First layer issues, bed leveling problems        |
-| `extruder_clicking`   | Clicking, grinding, under extrusion              |
-| `communication_error` | Printer offline, no response, timeout            |
-| `bed_adhesion`        | Warping, not sticking, lifting corners           |
+| Error type                 | Key symptoms                                         |
+|----------------------------|------------------------------------------------------|
+| `thermal_runaway`          | THERMAL RUNAWAY, Heating failed, temp sensor         |
+| `layer_shifting`           | Layer shift, skipped steps, position lost            |
+| `z_offset_drift`           | First layer issues, bed leveling problems            |
+| `extruder_clicking`        | Clicking, grinding, under extrusion                  |
+| `communication_error`      | Printer offline, no response, timeout                |
+| `bed_adhesion`             | Warping, not sticking, lifting corners               |
+| `bltouch_probe_error`      | BLTouch alarm, probe deploy/stow failed              |
+| `tmc_driver_noise`         | Motor noise, TMC2208 whining, stepper vibration      |
+| `hotend_ptfe_degradation`  | Burning smell, PTFE fumes, heat creep, repeat clogs  |
+| `tft_display_error`        | Screen frozen, white screen, TFT not responding      |
+| `psu_failure`              | Random shutdown, printer dies, 24V rail drop         |
+
+Each diagnosis includes **probable causes**, **numbered repair steps**, and
+**exact G-code commands** to run during troubleshooting.
 
 Ask Claude: *"My printer is making a clicking noise from the extruder"*
 → `diagnose_error("extruder clicking")` → full root cause analysis + repair steps.
