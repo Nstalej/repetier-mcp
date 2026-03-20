@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "repetier": {
+      "command": "uvx",
+      "args": ["repetier-mcp"],
+      "env": {
+        "REPETIER_MODE": "serial",
+        "REPETIER_PORT": "/dev/ttyUSB0",
+        "REPETIER_BAUD": "250000",
+        "PRINTER_MODEL": "sidewinder_x1"
+      }
+    }
+  }
+}
