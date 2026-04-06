@@ -1,11 +1,22 @@
 {
   "mcpServers": {
-    "repetier": {
-      "command": "uvx",
-      "args": ["repetier-mcp"],
+    "repetier-server-mode": {
+      "command": "python",
+      "args": ["-m", "repetier_mcp.server"],
+      "env": {
+        "REPETIER_MODE": "server",
+        "REPETIER_SERVER_URL": "http://localhost:3344",
+        "REPETIER_SERVER_APIKEY": "YOUR_API_KEY_HERE",
+        "REPETIER_PRINTER_SLUG": "SidewinderX1",
+        "PRINTER_MODEL": "sidewinder_x1"
+      }
+    },
+    "repetier-serial-mode": {
+      "command": "python",
+      "args": ["-m", "repetier_mcp.server"],
       "env": {
         "REPETIER_MODE": "serial",
-        "REPETIER_PORT": "/dev/ttyUSB0",
+        "REPETIER_PORT": "COM3",
         "REPETIER_BAUD": "250000",
         "PRINTER_MODEL": "sidewinder_x1"
       }

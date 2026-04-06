@@ -13,6 +13,7 @@ from repetier_mcp.server import (
     diagnose_error,
     knowledge_base_summary,
     _diagnose,
+    _parse_state_list,
     SIDEWINDER_X1_ERRORS,
     GENERIC_ERRORS,
 )
@@ -79,7 +80,7 @@ class TestDiagnoseError:
     def test_hotend_ptfe_degradation(self):
         result = diagnose_error("burning smell from PTFE and repeated clogs")
         assert "hotend_ptfe_degradation" in result
-        assert "240" in result  # temperatura límite PTFE
+        assert "240" in result  # temperatura limite PTFE
 
     def test_hotend_heat_creep(self):
         result = diagnose_error("heat creep jamming filament")
@@ -103,7 +104,7 @@ class TestDiagnoseError:
         result = diagnose_error("clicking from power supply when bed heats up")
         assert "psu_failure" in result
 
-    # ── Errores genéricos nuevos ───────────────────────────────────────────────
+    # ── Errores genericos nuevos ───────────────────────────────────────────────
 
     def test_mintemp_generic_error(self):
         result = diagnose_error("MINTEMP triggered")
@@ -128,7 +129,7 @@ class TestDiagnoseError:
 
     def test_gcode_helpers_shown_for_bltouch(self):
         result = diagnose_error("BLTouch deploy failed")
-        assert "📟" in result or "G-code" in result
+        assert "G-code" in result
         assert "M280" in result
 
     def test_gcode_helpers_shown_for_psu(self):
@@ -273,3 +274,128 @@ class TestTemperatureParsing:
                 bed = float(vals[0])
         assert hotend == pytest.approx(205.3)
         assert bed == pytest.approx(59.8)
+
+
+# ── Tests: stateList parsing (server mode) ──────────────────────────────────
+
+class TestStateListParsing:
+
+    def test_parse_idle_state(self):
+        data = {
+            "state": 0,
+            "temp": {
+                "extruder": [{"tempRead": 22.5, "tempSet": 0, "output": 0}],
+                "bed": {"tempRead": 24.1, "tempSet": 0, "output": 0},
+            },
+            "x": 0, "y": 0, "z": 0,
+        }
+        result = _parse_state_list(data)
+        assert result["state"] == "idle"
+        assert result["temperatures"]["hotend"]["actual_C"] == 22.5
+        assert result["temperatures"]["bed"]["actual_C"] == 24.1
+        assert result["position"]["X"] == 0
+
+    def test_parse_printing_state(self):
+        data = {
+            "state": 1,
+            "temp": {
+                "extruder": [{"tempRead": 205.0, "tempSet": 200.0, "output": 80}],
+                "bed": {"tempRead": 59.5, "tempSet": 60.0, "output": 30},
+            },
+            "x": 100.5, "y": 50.2, "z": 1.2,
+            "activeJob": "benchy.gcode",
+            "jobid": 42,
+            "done": 45.2,
+            "printTime": 1234,
+            "printedTimeComp": 5678,
+        }
+        result = _parse_state_list(data)
+        assert result["state"] == "printing"
+        assert result["temperatures"]["hotend"]["actual_C"] == 205.0
+        assert result["temperatures"]["hotend"]["target_C"] == 200.0
+        assert result["job"]["filename"] == "benchy.gcode"
+        assert result["job"]["progress_%"] == 45.2
+        assert result["job"]["job_id"] == 42
+        assert "remaining_min" in result["job"]
+
+    def test_parse_paused_state(self):
+        data = {"state": 2, "temp": {"extruder": [], "bed": {}}}
+        result = _parse_state_list(data)
+        assert result["state"] == "paused"
+
+    def test_parse_empty_temp_data(self):
+        data = {"state": 0, "temp": {}}
+        result = _parse_state_list(data)
+        assert result["state"] == "idle"
+        assert result["temperatures"] == {}
+
+    def test_parse_no_active_job(self):
+        data = {"state": 0, "temp": {"extruder": [], "bed": {}}}
+        result = _parse_state_list(data)
+        assert result["job"] == {}
+
+
+# ── Tests: new tools (server mode, mocked) ──────────────────────────────────
+
+class TestNewToolsServerMode:
+
+    @patch("repetier_mcp.server.CONNECTION_MODE", "serial")
+    def test_upload_and_print_serial_mode_rejected(self):
+        from repetier_mcp.server import upload_and_print
+        result = upload_and_print("/tmp/test.gcode")
+        assert "server" in result.lower() or "SERVER" in result
+
+    @patch("repetier_mcp.server.CONNECTION_MODE", "serial")
+    def test_pause_print_serial_mode_rejected(self):
+        from repetier_mcp.server import pause_print
+        result = pause_print()
+        assert "server" in result.lower() or "SERVER" in result
+
+    @patch("repetier_mcp.server.CONNECTION_MODE", "serial")
+    def test_resume_print_serial_mode_rejected(self):
+        from repetier_mcp.server import resume_print
+        result = resume_print()
+        assert "server" in result.lower() or "SERVER" in result
+
+    @patch("repetier_mcp.server.CONNECTION_MODE", "serial")
+    def test_cancel_print_serial_mode_rejected(self):
+        from repetier_mcp.server import cancel_print
+        result = cancel_print()
+        assert "server" in result.lower() or "SERVER" in result
+
+    @patch("repetier_mcp.server.CONNECTION_MODE", "serial")
+    def test_list_jobs_serial_mode_rejected(self):
+        from repetier_mcp.server import list_jobs
+        result = list_jobs()
+        assert "server" in result.lower() or "SERVER" in result
+
+
+class TestSetTemperature:
+
+    def test_invalid_target(self):
+        from repetier_mcp.server import set_temperature
+        result = set_temperature("fan", 100)
+        assert "invalid" in result.lower() or "Invalid" in result
+
+    def test_out_of_range_temperature(self):
+        from repetier_mcp.server import set_temperature
+        result = set_temperature("hotend", 400)
+        assert "out of" in result.lower() or "range" in result.lower()
+
+    def test_negative_temperature(self):
+        from repetier_mcp.server import set_temperature
+        result = set_temperature("bed", -10)
+        assert "out of" in result.lower() or "range" in result.lower()
+
+
+class TestSendGcodeSafety:
+
+    def test_m112_blocked(self):
+        from repetier_mcp.server import send_gcode
+        result = send_gcode("M112")
+        assert "emergency_stop" in result.lower() or "confirmation" in result.lower()
+
+    def test_m0_blocked(self):
+        from repetier_mcp.server import send_gcode
+        result = send_gcode("M0")
+        assert "confirmation" in result.lower() or "emergency" in result.lower()

@@ -1,85 +1,141 @@
-# repetier-mcp 🖨️
+# repetier-mcp
 
-**Servidor MCP para Repetier-Host / Repetier-Server — monitorea, controla y diagnostica tu impresora 3D con IA.**
+**Servidor MCP para Repetier-Host / Repetier-Server -- monitorea, controla y diagnostica tu impresora 3D con IA.**
 
 Conecta Claude (o cualquier IA compatible con MCP) directamente a tu impresora 3D.
-Obtén lecturas de temperatura en tiempo real, progreso de impresión, diagnóstico
-inteligente de errores y guías de reparación específicas para tu modelo — incluyendo
+Obtiene lecturas de temperatura en tiempo real, progreso de impresion, diagnostico
+inteligente de errores y guias de reparacion especificas para tu modelo -- incluyendo
 una base de datos integrada para la **Artillery Sidewinder X1**.
 
-> [🇬🇧 English](../README.md) | 🇪🇸 Español
+> [English](../README.md) | Espanol
 
 ---
 
-## ✨ Qué puedes hacer
+## Que puedes hacer
 
-| Dile a Claude...                                    | Qué sucede                                              |
+| Dile a Claude...                                    | Que sucede                                              |
 |-----------------------------------------------------|---------------------------------------------------------|
-| "¿Cuál es la temperatura de la impresora?"          | Devuelve temps del hotend y cama en tiempo real         |
-| "Mi impresora tiene problemas de layer shifting"    | Diagnostica causas y da guía de reparación paso a paso  |
-| "Envía M503 para leer la configuración actual"      | Envía G-code y devuelve los valores del EEPROM          |
-| "Verifica si las temperaturas son estables"         | Toma 5 lecturas en 10s y detecta inestabilidad          |
-| "¿En qué puerto está mi impresora?"                 | Escanea puertos serie y auto-detecta la impresora       |
+| "Cual es la temperatura de la impresora?"           | Devuelve temps del hotend y cama en tiempo real         |
+| "Mi impresora tiene problemas de layer shifting"    | Diagnostica causas y da guia de reparacion paso a paso  |
+| "Envia M503 para leer la configuracion actual"      | Envia G-code y devuelve los valores del EEPROM          |
+| "Sube e imprime benchy.gcode"                       | Sube archivo al servidor e inicia la impresion          |
+| "Pausa la impresion"                                | Pausa el trabajo actual via Repetier-Server             |
+| "Pon la cama a 60 grados"                           | Configura la cama caliente a 60C                        |
+| "En que puerto esta mi impresora?"                  | Escanea puertos serie y auto-detecta la impresora       |
 
 ---
 
-## 🚀 Instalación rápida
+## Instalacion rapida
+
+### Instalar desde GitHub
+
+```bash
+pip install git+https://github.com/Nstalej/repetier-mcp.git
+```
+
+O con `uv` (recomendado -- mas rapido y sin conflictos):
+
+```bash
+pip install uv
+uv pip install git+https://github.com/Nstalej/repetier-mcp.git
+```
+
+Para **modo serial** (USB directo), tambien instalar pyserial:
+
+```bash
+pip install "repetier-mcp[serial] @ git+https://github.com/Nstalej/repetier-mcp.git"
+```
+
+Para desarrollo:
+
+```bash
+git clone https://github.com/Nstalej/repetier-mcp.git
+cd repetier-mcp
+pip install -e ".[dev]"
+pytest
+```
+
+---
+
+## Modos de Conexion
+
+repetier-mcp soporta dos modos de conexion:
+
+### Modo 1: Repetier-Server (recomendado)
+
+Se conecta via HTTP REST API a Repetier-Server corriendo en tu red local.
+Soporta todas las funciones incluyendo subida de archivos, pausa/reanudar y gestion de trabajos.
+
+### Modo 2: Serial directo (USB)
+
+Se conecta directamente a la impresora via puerto USB/serie (pyserial).
+Modo clasico para usuarios de Repetier-Host. Requiere el extra `serial`.
+
+---
+
+## Configuracion
+
+### Modo Repetier-Server
+
+| Variable                 | Default                    | Descripcion                            |
+|--------------------------|----------------------------|----------------------------------------|
+| `REPETIER_MODE`          | `serial`                   | Cambiar a `server`                     |
+| `REPETIER_SERVER_URL`    | `http://localhost:3344`    | URL completa de Repetier-Server        |
+| `REPETIER_SERVER_APIKEY` | *(vacio)*                  | API key de Repetier-Server             |
+| `REPETIER_PRINTER_SLUG`  | *(vacio)*                  | Slug/nombre de la impresora en server  |
+| `PRINTER_MODEL`          | `sidewinder_x1`            | Modelo para diagnosticos               |
+
+### Modo USB directo / serie
+
+| Variable          | Default          | Descripcion                                            |
+|-------------------|------------------|--------------------------------------------------------|
+| `REPETIER_MODE`   | `serial`         | Modo de conexion: `serial` o `server`                  |
+| `REPETIER_PORT`   | *(auto)*         | Puerto serie, ej. `COM3` o `/dev/ttyUSB0`             |
+| `REPETIER_BAUD`   | `115200`         | Velocidad -- **usar `250000` para Sidewinder X1**      |
+| `PRINTER_MODEL`   | `sidewinder_x1`  | Modelo de impresora para diagnosticos                  |
+
+> **Auto-deteccion:** Si `REPETIER_SERVER_URL` esta definida y `REPETIER_MODE` no,
+> el modo server se selecciona automaticamente.
+
+---
+
+## Configurar Claude Desktop
 
 ### Windows
 
-#### Paso 1 — Instalar Python
-
-Descarga Python 3.10 o superior desde [python.org/downloads](https://www.python.org/downloads/).
-
-> ⚠️ **Importante:** durante la instalación, marca la casilla **"Add Python to PATH"**.
-
-Verifica en PowerShell o CMD:
-```
-python --version
-```
-
-#### Paso 2 — Instalar repetier-mcp
-
-Abre PowerShell o CMD y ejecuta:
-
-```powershell
-pip install repetier-mcp
-```
-
-O con `uv` (recomendado — más rápido y sin conflictos de dependencias):
-
-```powershell
-pip install uv
-uv tool install repetier-mcp
-```
-
-#### Paso 3 — Encontrar el puerto COM de tu impresora
-
-1. Conecta la impresora por USB
-2. Abre el **Administrador de dispositivos** (`Win + X` → Administrador de dispositivos)
-3. Expande **Puertos (COM y LPT)**
-4. Busca algo como `USB-SERIAL CH340 (COM3)` o `Silicon Labs CP210x (COM4)`
-5. Anota el número de puerto, por ejemplo `COM3`
-
-> **Tip Sidewinder X1:** El chip USB es CH340. Si no aparece, descarga el driver desde [wch-ic.com/downloads/CH341SER_EXE.html](http://www.wch-ic.com/downloads/CH341SER_EXE.html)
-
-#### Paso 4 — Configurar Claude Desktop
-
-Abre el archivo de configuración en:
+Abre el archivo de configuracion en:
 ```
 C:\Users\TU_USUARIO\AppData\Roaming\Claude\claude_desktop_config.json
 ```
 
-> Si no existe, créalo. Puedes abrirlo con el Bloc de notas o VS Code.
-
-Agrega esta configuración (reemplaza `COM3` con tu puerto):
+**Modo servidor (recomendado):**
 
 ```json
 {
   "mcpServers": {
     "repetier": {
-      "command": "uvx",
-      "args": ["repetier-mcp"],
+      "command": "python",
+      "args": ["-m", "repetier_mcp.server"],
+      "env": {
+        "REPETIER_MODE":          "server",
+        "REPETIER_SERVER_URL":    "http://localhost:3344",
+        "REPETIER_SERVER_APIKEY": "TU_API_KEY_AQUI",
+        "REPETIER_PRINTER_SLUG":  "SidewinderX1",
+        "PRINTER_MODEL":          "sidewinder_x1"
+      }
+    }
+  }
+}
+```
+
+**Modo serial:**
+
+```json
+{
+  "mcpServers": {
+    "repetier": {
+      "command": "python",
+      "args": ["-m", "repetier_mcp.server"],
       "env": {
         "REPETIER_MODE":  "serial",
         "REPETIER_PORT":  "COM3",
@@ -91,115 +147,84 @@ Agrega esta configuración (reemplaza `COM3` con tu puerto):
 }
 ```
 
-> **Sidewinder X1:** usa siempre `"REPETIER_BAUD": "250000"`.  
-> Si la conexión falla con 250000, prueba `"115200"` como segunda opción.
-
-Reinicia Claude Desktop. ¡Listo! 🎉
+Reinicia Claude Desktop.
 
 ---
 
 ### Linux
 
-#### Paso 1 — Instalar repetier-mcp
-
 ```bash
-pip install repetier-mcp
-# o con uv:
-pip install uv
-uv tool install repetier-mcp
+pip install "git+https://github.com/Nstalej/repetier-mcp.git"
+# Para modo serial:
+# pip install "repetier-mcp[serial] @ git+https://github.com/Nstalej/repetier-mcp.git"
+# sudo usermod -a -G dialout $USER  # luego cierra sesion y vuelve a entrar
 ```
 
-#### Paso 2 — Permisos del puerto serie
-
-En Linux es necesario agregar tu usuario al grupo `dialout`:
-
-```bash
-sudo usermod -a -G dialout $USER
-```
-
-Luego **cierra sesión y vuelve a entrar** para que el cambio tenga efecto.
-
-#### Paso 3 — Encontrar el puerto
-
-```bash
-ls /dev/ttyUSB* /dev/ttyACM*
-# Resultado típico: /dev/ttyUSB0
-```
-
-#### Paso 4 — Configurar Claude Desktop
-
-Edita `~/.config/Claude/claude_desktop_config.json` (Linux) o
-`~/Library/Application Support/Claude/claude_desktop_config.json` (macOS):
+Edita `~/.config/Claude/claude_desktop_config.json`:
 
 ```json
 {
   "mcpServers": {
     "repetier": {
-      "command": "uvx",
-      "args": ["repetier-mcp"],
+      "command": "python3",
+      "args": ["-m", "repetier_mcp.server"],
       "env": {
-        "REPETIER_MODE":  "serial",
-        "REPETIER_PORT":  "/dev/ttyUSB0",
-        "REPETIER_BAUD":  "250000",
-        "PRINTER_MODEL":  "sidewinder_x1"
+        "REPETIER_MODE":          "server",
+        "REPETIER_SERVER_URL":    "http://localhost:3344",
+        "REPETIER_SERVER_APIKEY": "TU_API_KEY_AQUI",
+        "REPETIER_PRINTER_SLUG":  "SidewinderX1",
+        "PRINTER_MODEL":          "sidewinder_x1"
       }
     }
   }
 }
 ```
 
-Reinicia Claude Desktop. 🎉
+---
+
+## Solucion de problemas (Windows)
+
+| Problema | Solucion |
+|---|---|
+| Impresora no aparece en Admin. de dispositivos | Prueba otro cable USB -- muchos cables solo cargan |
+| Driver CH340 faltante | Instalar desde [wch-ic.com](http://www.wch-ic.com/downloads/CH341SER_EXE.html) |
+| Puerto ocupado / acceso denegado | Cierra Repetier-Host -- no pueden usar el mismo puerto |
+| No conecta al servidor | Verifica que Repetier-Server esta corriendo y la URL/puerto son correctos |
+| Error de API key | Verifica que REPETIER_SERVER_APIKEY coincide con la clave en Repetier-Server |
+| Slug de impresora no encontrado | Verifica que REPETIER_PRINTER_SLUG coincide con el nombre en Repetier-Server |
 
 ---
 
-## 🛠️ Herramientas disponibles
+## Herramientas disponibles
 
-| Herramienta              | Descripción                                                      |
-|--------------------------|------------------------------------------------------------------|
-| `printer_status`         | Temperaturas, progreso de impresión y posición actual            |
-| `send_gcode`             | Envía cualquier comando G-code / M-code                         |
-| `temperature_check`      | Análisis de estabilidad térmica con múltiples muestras           |
-| `list_jobs`              | Lista la cola de impresión (modo Repetier-Server)               |
-| `diagnose_error`         | Diagnóstico con IA y guía de reparación paso a paso             |
-| `knowledge_base_summary` | Muestra todos los tipos de error conocidos y sus síntomas        |
-| `list_serial_ports`      | Escanea y auto-detecta el puerto de la impresora                |
-| `emergency_stop`         | Envía parada de emergencia M112                                  |
-
----
-
-## ⚙️ Configuración
-
-### USB directo / serie (Repetier-Host)
-
-| Variable          | Valor por defecto | Descripción                                            |
-|-------------------|-------------------|--------------------------------------------------------|
-| `REPETIER_MODE`   | `serial`          | Modo de conexión: `serial` o `server`                  |
-| `REPETIER_PORT`   | *(auto)*          | Puerto serie, ej. `COM3` (Windows) o `/dev/ttyUSB0`   |
-| `REPETIER_BAUD`   | `115200`          | Velocidad — **usar `250000` para Sidewinder X1**       |
-| `PRINTER_MODEL`   | `sidewinder_x1`   | Modelo de impresora para diagnósticos dirigidos         |
-
-### Repetier-Server (red local)
-
-| Variable              | Valor por defecto | Descripción                              |
-|-----------------------|-------------------|------------------------------------------|
-| `REPETIER_MODE`       | `server`          | Cambiar a `server`                       |
-| `REPETIER_HOST`       | `localhost`       | IP o hostname del Repetier-Server        |
-| `REPETIER_HTTP_PORT`  | `3344`            | Puerto del servidor (default 3344)       |
-| `REPETIER_API_KEY`    | *(vacío)*         | API key si la autenticación está activa  |
-| `REPETIER_PRINTER`    | *(vacío)*         | Slug/nombre de la impresora en el server |
+| Herramienta              | Modo   | Descripcion                                                |
+|--------------------------|--------|------------------------------------------------------------|
+| `printer_status`         | Ambos  | Temperaturas, progreso de impresion y posicion             |
+| `send_gcode`             | Ambos  | Envia cualquier comando G-code / M-code                   |
+| `temperature_check`      | Ambos  | Analisis de estabilidad termica con multiples muestras     |
+| `set_temperature`        | Ambos  | Configura temperatura del hotend o cama                    |
+| `list_jobs`              | Server | Lista la cola de impresion                                 |
+| `upload_and_print`       | Server | Sube archivo .gcode e inicia impresion                     |
+| `pause_print`            | Server | Pausa el trabajo de impresion actual                       |
+| `resume_print`           | Server | Reanuda un trabajo pausado                                 |
+| `cancel_print`           | Server | Cancela/detiene la impresion actual                        |
+| `diagnose_error`         | Ambos  | Diagnostico con IA y guia de reparacion paso a paso        |
+| `knowledge_base_summary` | Ambos  | Muestra todos los tipos de error conocidos                 |
+| `list_serial_ports`      | Ambos  | Escanea puertos serie o muestra info del servidor          |
+| `emergency_stop`         | Ambos  | Envia parada de emergencia M112                            |
 
 ---
 
-## 🔍 Base de diagnóstico — Artillery Sidewinder X1
+## Base de diagnostico -- Artillery Sidewinder X1
 
-Base de datos integrada con 11 tipos de error específicos del modelo:
+Base de datos integrada con **11 tipos de error** especificos del modelo:
 
-| Error                    | Síntomas clave                                          |
+| Error                    | Sintomas clave                                          |
 |--------------------------|---------------------------------------------------------|
 | `thermal_runaway`        | THERMAL RUNAWAY, Heating failed, sensor de temperatura  |
 | `layer_shifting`         | Capas desplazadas, pasos perdidos                       |
-| `z_offset_drift`         | Primera capa, nivelación de cama                        |
-| `extruder_clicking`      | Click, grinding, sub-extrusión                          |
+| `z_offset_drift`         | Primera capa, nivelacion de cama                        |
+| `extruder_clicking`      | Click, grinding, sub-extrusion                          |
 | `communication_error`    | Impresora offline, sin respuesta, timeout               |
 | `bed_adhesion`           | Warping, no pega, esquinas levantadas                   |
 | `bltouch_probe_error`    | BLTouch alarm, probe deploy fallido                     |
@@ -208,67 +233,41 @@ Base de datos integrada con 11 tipos de error específicos del modelo:
 | `tft_display_error`      | Pantalla congelada, pantalla blanca, TFT                |
 | `psu_failure`            | Apagado aleatorio, impresora muere, fuente de poder     |
 
-**Ejemplo de uso:** dile a Claude *"Mi impresora tiene un clic en el extrusor"*
-→ `diagnose_error("extruder clicking")` → análisis completo de causas y pasos de reparación con los G-codes exactos.
+Mas **4 errores genericos** (mintemp, maxtemp, filament_runout, sd_card_error).
 
 ---
 
-## 🐛 Solución de problemas comunes en Windows
+## Referencia API REST de Repetier-Server
 
-### La impresora no aparece en el Administrador de dispositivos
-- Prueba con un cable USB diferente — muchos cables solo cargan, no transmiten datos
-- Instala el driver CH340: [wch-ic.com/downloads/CH341SER_EXE.html](http://www.wch-ic.com/downloads/CH341SER_EXE.html)
-- Prueba otro puerto USB físico en tu PC
+El modo servidor usa la API REST de Repetier-Server:
 
-### Claude no puede conectar aunque el puerto es correcto
-- Verifica que Repetier-Host esté **cerrado** — no pueden usar el mismo puerto a la vez
-- Desactiva la administración de energía del puerto USB:
-  `Administrador de dispositivos → Concentradores USB → Propiedades → Administración de energía → desmarcar "permitir suspensión"`
-- Reduce el cache de recepción: agrega `"REPETIER_TIMEOUT": "5"` a las variables de entorno
-
-### Error "command not found: uvx"
-```powershell
-pip install uv
-# luego cierra y vuelve a abrir PowerShell
-uvx --version
 ```
-
-### El baud rate correcto para la Sidewinder X1
-El firmware stock de Artillery usa **250000 baud**. Si con 250000 ves el error `1 Commands Waiting` en Repetier-Host, el baud está mal configurado. Prueba también `115200` si 250000 no funciona en tu configuración específica.
+GET  /printer/api/{slug}?a=stateList&apikey={key}           # Estado completo
+GET  /printer/api/{slug}?a=send&data={"cmd":"G28"}&apikey={key}  # Enviar G-code
+GET  /printer/api/{slug}?a=listJobs&apikey={key}             # Listar trabajos
+GET  /printer/api/{slug}?a=pause&apikey={key}                # Pausar impresion
+GET  /printer/api/{slug}?a=continueJob&apikey={key}          # Reanudar impresion
+GET  /printer/api/{slug}?a=stopJob&apikey={key}              # Cancelar impresion
+POST /printer/job/{slug}?a=upload&name=file.gcode&apikey={key}   # Subir gcode
+```
 
 ---
 
-## 📦 Parte del ecosistema maker-mcp
-
-Este servidor se combina con **[openscad-mcp](https://github.com/Nstalej/openscad-mcp)**
-para un flujo completo diseño → impresión:
-
-```
-Claude  →  openscad-mcp  →  diseña .scad → exporta .stl
-                                               ↓
-        →  repetier-mcp  →  impresora → monitoreo → diagnóstico
-```
-
-O instala **[maker-mcp-suite](https://github.com/Nstalej/maker-mcp-suite)**
-para tener todo en un solo servidor.
-
----
-
-## 🗺️ Roadmap
+## Roadmap
 
 - [ ] Compatibilidad con OctoPrint
 - [ ] Soporte para Klipper / Moonraker
-- [ ] Integración con cámara webcam
-- [ ] Predicción de tiempo de impresión
+- [ ] Integracion con camara webcam
+- [ ] Prediccion de tiempo de impresion
 - [ ] Seguimiento de uso de filamento
-- [ ] Asistente de calibración EEPROM para Sidewinder X1
+- [ ] Asistente de calibracion EEPROM para Sidewinder X1
 
 ---
 
-## 🤝 Contribuir
+## Contribuir
 
 Issues y PRs son bienvenidos. Especialmente:
-- Nuevos modelos de impresora para la base de diagnóstico
+- Nuevos modelos de impresora para la base de diagnostico
 - Adaptador para Klipper / Moonraker
 
 ```bash
@@ -280,6 +279,6 @@ pytest
 
 ---
 
-## 📄 Licencia
+## Licencia
 
-MIT © 2025 — Ver [LICENSE](../LICENSE)
+MIT -- Ver [LICENSE](../LICENSE)

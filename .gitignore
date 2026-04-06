@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+.env
+*.env
+*.stl
+*.3mf
+*.amf
+*.png
+workspace/
+.openscad-mcp/

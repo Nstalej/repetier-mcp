@@ -6,21 +6,19 @@ Repetier-Host (USB/serial) or Repetier-Server (network API).
 
 Capabilities:
 - Real-time printer status: temperatures, job progress, layer info
-- Job control: start, pause, cancel, list queued jobs
+- Job control: start, pause, resume, cancel, list queued jobs
 - G-code: send raw commands, query EEPROM settings
 - Diagnostics: intelligent error analysis with Sidewinder X1 knowledge base
 - Temperature history: track hotend/bed readings over time
+- File upload: send gcode files to Repetier-Server for printing
 """
 
 import os
 import json
 import time
-import serial          # pyserial
-import serial.tools.list_ports
+import urllib.parse
 from typing import Optional
-from dataclasses import dataclass, asdict
 
-import requests
 from mcp.server.fastmcp import FastMCP
 
 # ── Server init ────────────────────────────────────────────────────────────────
@@ -45,10 +43,21 @@ SERIAL_BAUD       = int(os.environ.get("REPETIER_BAUD", "115200"))
 SERIAL_TIMEOUT    = float(os.environ.get("REPETIER_TIMEOUT", "3.0"))
 
 # Repetier-Server (network)
-SERVER_HOST       = os.environ.get("REPETIER_HOST",   "localhost")
-SERVER_HTTP_PORT  = int(os.environ.get("REPETIER_HTTP_PORT", "3344"))
-SERVER_API_KEY    = os.environ.get("REPETIER_API_KEY", "")
-PRINTER_SLUG      = os.environ.get("REPETIER_PRINTER", "")        # slug/name in server
+SERVER_URL        = os.environ.get("REPETIER_SERVER_URL", "http://localhost:3344")
+SERVER_API_KEY    = os.environ.get("REPETIER_SERVER_APIKEY",
+                   os.environ.get("REPETIER_API_KEY", ""))
+PRINTER_SLUG      = os.environ.get("REPETIER_PRINTER_SLUG",
+                   os.environ.get("REPETIER_PRINTER", ""))
+
+# Legacy compat: build SERVER_URL from old HOST/PORT vars if new var not set
+if "REPETIER_SERVER_URL" not in os.environ:
+    _host = os.environ.get("REPETIER_HOST", "localhost")
+    _port = os.environ.get("REPETIER_HTTP_PORT", "3344")
+    SERVER_URL = f"http://{_host}:{_port}"
+
+# Auto-detect mode: if SERVER_URL is explicitly set, default to server mode
+if "REPETIER_SERVER_URL" in os.environ and "REPETIER_MODE" not in os.environ:
+    CONNECTION_MODE = "server"
 
 # Printer model for targeted diagnostics
 PRINTER_MODEL     = os.environ.get("PRINTER_MODEL",   "sidewinder_x1")
@@ -56,8 +65,9 @@ PRINTER_MODEL     = os.environ.get("PRINTER_MODEL",   "sidewinder_x1")
 
 # ── Serial connection helpers ──────────────────────────────────────────────────
 
-def _open_serial() -> serial.Serial:
+def _open_serial():
     """Open a serial connection to the printer."""
+    import serial
     port = SERIAL_PORT or _auto_detect_port()
     if not port:
         raise ConnectionError(
@@ -69,6 +79,7 @@ def _open_serial() -> serial.Serial:
 
 def _auto_detect_port() -> str:
     """Try to auto-detect a connected 3D printer via USB serial."""
+    import serial.tools.list_ports
     known_descriptions = ["USB Serial", "CH340", "CP210", "FTDI", "Arduino"]
     ports = serial.tools.list_ports.comports()
     for p in ports:
@@ -84,6 +95,7 @@ def _send_gcode_serial(gcode: str, wait_lines: int = 5) -> list[str]:
     Send a G-code command over serial and collect response lines.
     Returns list of response lines from the printer.
     """
+    import serial
     responses = []
     try:
         with _open_serial() as ser:
@@ -101,34 +113,139 @@ def _send_gcode_serial(gcode: str, wait_lines: int = 5) -> list[str]:
     return responses
 
 
-# ── Repetier-Server API helpers ───────────────────────────────────────────────
+# ── Repetier-Server REST API helpers ─────────────────────────────────────────
 
-def _server_url(path: str) -> str:
-    return f"http://{SERVER_HOST}:{SERVER_HTTP_PORT}{path}"
+def _server_api_url(action: str, extra_params: Optional[dict] = None) -> str:
+    """Build a Repetier-Server REST API URL.
 
-
-def _server_get(path: str, params: Optional[dict] = None) -> dict:
-    """GET from Repetier-Server API, returns parsed JSON."""
-    p = params or {}
+    Format: {SERVER_URL}/printer/api/{PRINTER_SLUG}?a={action}&apikey={key}&...
+    """
+    slug = PRINTER_SLUG or "default"
+    params = {"a": action}
     if SERVER_API_KEY:
-        p["apikey"] = SERVER_API_KEY
+        params["apikey"] = SERVER_API_KEY
+    if extra_params:
+        params.update(extra_params)
+    query = urllib.parse.urlencode(params)
+    return f"{SERVER_URL}/printer/api/{slug}?{query}"
+
+
+def _server_get(action: str, data: Optional[dict] = None,
+                extra_params: Optional[dict] = None) -> dict:
+    """GET from Repetier-Server API, returns parsed JSON."""
+    import requests
+    slug = PRINTER_SLUG or "default"
+    params: dict = {"a": action}
+    if SERVER_API_KEY:
+        params["apikey"] = SERVER_API_KEY
+    if data is not None:
+        params["data"] = json.dumps(data)
+    if extra_params:
+        params.update(extra_params)
+    url = f"{SERVER_URL}/printer/api/{slug}"
     try:
-        r = requests.get(_server_url(path), params=p, timeout=5)
+        r = requests.get(url, params=params, timeout=10)
         r.raise_for_status()
         return r.json()
+    except requests.ConnectionError:
+        return {"error": f"Cannot connect to Repetier-Server at {SERVER_URL}. Is the server running?"}
+    except requests.Timeout:
+        return {"error": f"Timeout connecting to Repetier-Server at {SERVER_URL} (10s limit)."}
+    except requests.HTTPError as e:
+        if e.response is not None and e.response.status_code in (401, 403):
+            return {"error": "API key is invalid or missing. Check REPETIER_SERVER_APIKEY."}
+        return {"error": f"HTTP error: {e}"}
     except requests.RequestException as e:
         return {"error": str(e)}
 
 
-def _server_post(path: str, data: dict) -> dict:
+def _server_post_upload(filepath: str, filename: str,
+                        autostart: bool = True) -> dict:
+    """Upload a gcode file to Repetier-Server via POST."""
+    import requests
+    slug = PRINTER_SLUG or "default"
+    params = {
+        "a": "upload",
+        "name": filename,
+    }
+    if autostart:
+        params["autostart"] = "true"
     if SERVER_API_KEY:
-        data["apikey"] = SERVER_API_KEY
+        params["apikey"] = SERVER_API_KEY
+    url = f"{SERVER_URL}/printer/job/{slug}"
     try:
-        r = requests.post(_server_url(path), json=data, timeout=5)
+        with open(filepath, "rb") as f:
+            r = requests.post(
+                url,
+                params=params,
+                data=f.read(),
+                headers={"Content-Type": "application/octet-stream"},
+                timeout=120,
+            )
         r.raise_for_status()
-        return r.json() if r.text else {"ok": True}
+        return r.json() if r.text.strip() else {"ok": True}
+    except FileNotFoundError:
+        return {"error": f"File not found: {filepath}"}
+    except requests.ConnectionError:
+        return {"error": f"Cannot connect to Repetier-Server at {SERVER_URL}."}
     except requests.RequestException as e:
         return {"error": str(e)}
+
+
+def _parse_state_list(data: dict) -> dict:
+    """Parse stateList response into a clean status dict."""
+    state_map = {0: "idle", 1: "printing", 2: "paused", 3: "waiting"}
+    state_code = data.get("state", -1)
+
+    result = {
+        "state": state_map.get(state_code, f"unknown ({state_code})"),
+        "temperatures": {},
+        "position": {},
+        "job": {},
+    }
+
+    # Temperatures
+    temp_data = data.get("temp", {})
+    extruders = temp_data.get("extruder", [])
+    if extruders and len(extruders) > 0:
+        ext = extruders[0]
+        result["temperatures"]["hotend"] = {
+            "actual_C": ext.get("tempRead", 0),
+            "target_C": ext.get("tempSet", 0),
+            "output_%": ext.get("output", 0),
+        }
+    bed = temp_data.get("bed", {})
+    if bed:
+        result["temperatures"]["bed"] = {
+            "actual_C": bed.get("tempRead", 0),
+            "target_C": bed.get("tempSet", 0),
+            "output_%": bed.get("output", 0),
+        }
+
+    # Position
+    for axis in ("x", "y", "z"):
+        if axis in data:
+            result["position"][axis.upper()] = data[axis]
+
+    # Job info
+    active_job = data.get("activeJob", "")
+    if active_job:
+        result["job"] = {
+            "filename": active_job,
+            "job_id": data.get("jobid", None),
+            "progress_%": round(data.get("done", 0), 1),
+            "print_time_s": data.get("printTime", 0),
+            "estimated_total_s": data.get("printedTimeComp", 0),
+        }
+        # Calculate remaining time
+        total = data.get("printedTimeComp", 0)
+        elapsed = data.get("printTime", 0)
+        if total > 0 and elapsed > 0:
+            remaining = max(0, total - elapsed)
+            mins = int(remaining // 60)
+            result["job"]["remaining_min"] = mins
+
+    return result
 
 
 # ── Sidewinder X1 diagnostic knowledge base ───────────────────────────────────
@@ -163,7 +280,7 @@ SIDEWINDER_X1_ERRORS = {
             "2. Tension Y belt: same target. Use printed tensioners if needed",
             "3. Check all 4 set screws on X motor pulley and Y motor pulley",
             "4. Reduce print speed to 60 mm/s max for first diagnosis",
-            "5. In Marlin: increase X_CURRENT and Y_CURRENT by 50–100mA",
+            "5. In Marlin: increase X_CURRENT and Y_CURRENT by 50-100mA",
         ],
     },
     "z_offset_drift": {
@@ -189,8 +306,8 @@ SIDEWINDER_X1_ERRORS = {
             "Bowden tube gap at hotend end (PTFE retraction gap)",
         ],
         "fixes": [
-            "1. Cold pull: heat to 200°C, push filament manually, cool to 90°C, pull firmly",
-            "2. Increase hotend temp by 5°C increments until clicking stops",
+            "1. Cold pull: heat to 200C, push filament manually, cool to 90C, pull firmly",
+            "2. Increase hotend temp by 5C increments until clicking stops",
             "3. Check/tighten Bowden clip at hotend coupling",
             "4. Inspect extruder arm spring — replace if flattened",
             "5. Consider Micro-Swiss all-metal hotend to eliminate PTFE degradation",
@@ -223,8 +340,8 @@ SIDEWINDER_X1_ERRORS = {
         "fixes": [
             "1. Clean PEI/glass with IPA 90%+ before every print",
             "2. Lower Z-offset by 0.05mm increments until first layer squishes",
-            "3. PLA: 60°C bed | PETG: 80°C | ABS: 100°C + enclosure",
-            "4. Add 5–8mm brim for large flat parts",
+            "3. PLA: 60C bed | PETG: 80C | ABS: 100C + enclosure",
+            "4. Add 5-8mm brim for large flat parts",
         ],
     },
 
@@ -278,7 +395,7 @@ SIDEWINDER_X1_ERRORS = {
         ],
         "fixes": [
             "1. Measure Vref on TMC2208: target 0.9V for ~0.9A RMS (Sidewinder X1 motors)",
-            "2. Formula: Vref = (motor_current_A × 2.5) / 2.0  — for TMC2208 in standalone",
+            "2. Formula: Vref = (motor_current_A x 2.5) / 2.0  — for TMC2208 in standalone",
             "3. Enable StealthChop in Marlin: set STEALTHCHOP_XY and STEALTHCHOP_Z to true",
             "4. If UART mode: set driver current via M906 X800 Y800 Z800 E650 (mA values)",
             "5. Check all motor cable connectors — reseat connectors at both motor and board",
@@ -287,7 +404,7 @@ SIDEWINDER_X1_ERRORS = {
         ],
         "gcode_helpers": [
             "M906 X800 Y800 Z800 E650  ; Set motor currents (mA) — requires UART mode",
-            "M201 X500 Y500 Z100       ; Set max acceleration (mm/s²)",
+            "M201 X500 Y500 Z100       ; Set max acceleration (mm/s2)",
             "M203 X200 Y200 Z10        ; Set max feedrate (mm/s)",
             "M500                      ; Save to EEPROM",
         ],
@@ -302,24 +419,24 @@ SIDEWINDER_X1_ERRORS = {
         ],
         "causes": [
             "Stock Sidewinder X1 Volcano hotend has PTFE tube that reaches the heat break",
-            "PTFE liner degrades above 240°C releasing fumes — do NOT print ABS with stock hotend",
+            "PTFE liner degrades above 240C releasing fumes — do NOT print ABS with stock hotend",
             "Heat creep: hotend cooling fan too slow or blocked, heat migrates up into cold zone",
             "PTFE tube end cut at angle instead of flat — creates gap where filament curls",
             "Bowden tube inner diameter worn out — 1.75mm filament needs tight ID tolerance",
             "Nozzle partially blocked from printing low-quality or abrasive filaments",
         ],
         "fixes": [
-            "1. IMMEDIATE: Do NOT print above 240°C with stock PTFE-lined hotend",
+            "1. IMMEDIATE: Do NOT print above 240C with stock PTFE-lined hotend",
             "2. Check hotend cooling fan — must spin at full speed during the entire print",
             "3. Cut Bowden tube end perfectly flat using a tube cutter (not scissors)",
             "4. Upgrade path: Micro-Swiss all-metal hotend eliminates PTFE from heat zone",
-            "5. After upgrade to all-metal: increase retraction to 6–7mm and temp by 5–10°C",
-            "6. Clean nozzle: atomic/cold pull with nylon filament at 250°C",
+            "5. After upgrade to all-metal: increase retraction to 6-7mm and temp by 5-10C",
+            "6. Clean nozzle: atomic/cold pull with nylon filament at 250C",
             "7. Replace Bowden tube with Capricorn XS (tighter ID = better filament control)",
         ],
         "gcode_helpers": [
             "M106 S255  ; Fan at 100% — verify hotend fan responds",
-            "M104 S200  ; Set hotend to 200°C for cold pull",
+            "M104 S200  ; Set hotend to 200C for cold pull",
             "M104 S0    ; Turn off hotend after maintenance",
         ],
     },
@@ -363,24 +480,24 @@ SIDEWINDER_X1_ERRORS = {
             "printer dies", "mid-print shutdown", "restarts randomly",
         ],
         "causes": [
-            "Stock PSU in some Sidewinder X1 batches (2019–2021) is undersized for bed + hotend load",
+            "Stock PSU in some Sidewinder X1 batches (2019-2021) is undersized for bed + hotend load",
             "PSU fan clogged with dust — thermal shutdown during long prints",
             "Loose AC input connector inside PSU causing intermittent power loss",
             "Heated bed draws ~200W peak — combined with hotend hits PSU limit",
-            "PSU capacitors degrading after 1–2 years of heavy use",
+            "PSU capacitors degrading after 1-2 years of heavy use",
             "Mains voltage fluctuations in some regions destabilizing PSU output",
         ],
         "fixes": [
             "1. Clean PSU fan vents with compressed air — check monthly",
             "2. Measure 24V rail with multimeter under load: should stay above 23.5V",
             "3. Check all wiring connections inside PSU cover (AC input terminal block)",
-            "4. Reduce bed temperature by 5°C to lower PSU load during diagnosis",
+            "4. Reduce bed temperature by 5C to lower PSU load during diagnosis",
             "5. Upgrade: replace with Meanwell LRS-350-24 (350W, proven reliable, ~$25)",
             "6. Add external MOSFET for heated bed to reduce load on mainboard/PSU wiring",
             "7. If PSU clicks when bed heats: failing capacitor — replace PSU immediately",
         ],
         "gcode_helpers": [
-            "M140 S55    ; Reduce bed to 55°C to lower PSU load during diagnosis",
+            "M140 S55    ; Reduce bed to 55C to lower PSU load during diagnosis",
             "M303 E-1 S60 C8  ; Re-tune bed PID after PSU replacement",
             "M500        ; Save PID values",
         ],
@@ -396,9 +513,9 @@ GENERIC_ERRORS = {
         ],
         "fixes": [
             "1. Check thermistor connector at mainboard (E0_TEMP and BED_TEMP headers)",
-            "2. Test thermistor resistance: should read ~100kΩ at room temp (NTC 100k)",
+            "2. Test thermistor resistance: should read ~100k ohm at room temp (NTC 100k)",
             "3. Inspect wire for breaks near the hotend where it flexes most",
-            "4. Replace thermistor cartridge if resistance reads open (∞) or shorted (0)",
+            "4. Replace thermistor cartridge if resistance reads open or shorted (0)",
         ],
         "gcode_helpers": [
             "M105  ; Read current temps — if MINTEMP persists, thermistor is open",
@@ -445,14 +562,14 @@ GENERIC_ERRORS = {
         "symptoms": ["SD card", "SD init", "card error", "no card", "SD read error"],
         "causes": [
             "SD card not fully seated in slot",
-            "SD card formatted incorrectly (must be FAT32, ≤32GB)",
+            "SD card formatted incorrectly (must be FAT32, <=32GB)",
             "Corrupted files on SD card",
             "SD card slot pins bent or dirty",
         ],
         "fixes": [
             "1. Remove and reinsert SD card firmly",
             "2. Format SD card as FAT32 with 4096 byte allocation unit",
-            "3. Use SD card ≤32GB — larger cards may not be recognized",
+            "3. Use SD card <=32GB — larger cards may not be recognized",
             "4. Test with a known-good SD card",
             "5. Clean SD card pins with IPA and a soft brush",
         ],
@@ -521,18 +638,18 @@ def printer_status() -> str:
     """
     Get the current status of the 3D printer.
 
-    Returns temperatures (hotend, bed), print job progress, current layer,
-    print speed, fan speed, and online/offline status.
+    Returns temperatures (hotend, bed), print job progress, current position,
+    and online/offline status.
 
     Works with both direct USB/serial (Repetier-Host) and
     Repetier-Server network connections.
     """
     if CONNECTION_MODE == "server":
-        slug = PRINTER_SLUG or "default"
-        data = _server_get(f"/printer/info/{slug}")
+        data = _server_get("stateList")
         if "error" in data:
             return f"ERROR connecting to Repetier-Server: {data['error']}"
-        return json.dumps(data, indent=2)
+        parsed = _parse_state_list(data)
+        return json.dumps(parsed, indent=2)
 
     # Serial mode — query via M105 (temperatures) + M27 (SD progress)
     results = {}
@@ -617,9 +734,10 @@ def send_gcode(command: str, description: str = "") -> str:
         )
 
     if CONNECTION_MODE == "server":
-        slug = PRINTER_SLUG or "default"
-        result = _server_get(f"/printer/send/{slug}", {"cmd": command})
-        return json.dumps(result)
+        result = _server_get("send", data={"cmd": command})
+        if "error" in result:
+            return f"ERROR: {result['error']}"
+        return f"Sent: {command}\nServer response: {json.dumps(result)}"
 
     lines = _send_gcode_serial(cmd, wait_lines=10)
     note = f"[{description}] " if description else ""
@@ -642,11 +760,159 @@ def list_jobs() -> str:
             "In direct USB mode, use send_gcode('M27') to check SD card progress."
         )
 
-    slug = PRINTER_SLUG or "default"
-    data = _server_get(f"/printer/jobs/{slug}")
+    data = _server_get("listJobs")
     if "error" in data:
         return f"ERROR: {data['error']}"
     return json.dumps(data, indent=2)
+
+
+# ── Tool: upload_and_print ────────────────────────────────────────────────────
+
+@mcp.tool()
+def upload_and_print(filepath: str, autostart: bool = True) -> str:
+    """
+    Upload a G-code file to Repetier-Server and optionally start printing.
+
+    Only available in server mode (CONNECTION_MODE=server).
+
+    Args:
+        filepath:  Full path to the .gcode file on this computer.
+        autostart: If True, start printing immediately after upload.
+
+    Returns:
+        Upload result with status.
+    """
+    if CONNECTION_MODE != "server":
+        return "File upload requires Repetier-Server (CONNECTION_MODE=server)."
+
+    import os.path
+    filename = os.path.basename(filepath)
+    if not filename.lower().endswith(".gcode"):
+        return f"File must be a .gcode file. Got: {filename}"
+
+    result = _server_post_upload(filepath, filename, autostart=autostart)
+    if "error" in result:
+        return f"ERROR uploading file: {result['error']}"
+
+    action = "uploaded and started" if autostart else "uploaded (not started)"
+    return f"File '{filename}' {action} successfully.\n{json.dumps(result, indent=2)}"
+
+
+# ── Tool: pause_print ─────────────────────────────────────────────────────────
+
+@mcp.tool()
+def pause_print() -> str:
+    """
+    Pause the current print job.
+
+    Only available in server mode (CONNECTION_MODE=server).
+    In serial mode, use send_gcode('M0') or send_gcode('M25') instead.
+
+    Returns:
+        Confirmation that the print was paused.
+    """
+    if CONNECTION_MODE != "server":
+        return (
+            "Pause requires Repetier-Server (CONNECTION_MODE=server).\n"
+            "In serial mode, try send_gcode('M25') for SD card pause."
+        )
+
+    result = _server_get("pause")
+    if "error" in result:
+        return f"ERROR: {result['error']}"
+    return "Print paused successfully."
+
+
+# ── Tool: resume_print ────────────────────────────────────────────────────────
+
+@mcp.tool()
+def resume_print() -> str:
+    """
+    Resume a paused print job.
+
+    Only available in server mode (CONNECTION_MODE=server).
+    In serial mode, use send_gcode('M24') instead.
+
+    Returns:
+        Confirmation that the print was resumed.
+    """
+    if CONNECTION_MODE != "server":
+        return (
+            "Resume requires Repetier-Server (CONNECTION_MODE=server).\n"
+            "In serial mode, try send_gcode('M24') for SD card resume."
+        )
+
+    result = _server_get("continueJob")
+    if "error" in result:
+        return f"ERROR: {result['error']}"
+    return "Print resumed successfully."
+
+
+# ── Tool: cancel_print ────────────────────────────────────────────────────────
+
+@mcp.tool()
+def cancel_print() -> str:
+    """
+    Cancel/stop the current print job.
+
+    Only available in server mode (CONNECTION_MODE=server).
+    WARNING: This stops the print and cannot be undone.
+
+    Returns:
+        Confirmation that the print was cancelled.
+    """
+    if CONNECTION_MODE != "server":
+        return (
+            "Cancel requires Repetier-Server (CONNECTION_MODE=server).\n"
+            "In serial mode, use emergency_stop() for immediate halt."
+        )
+
+    result = _server_get("stopJob")
+    if "error" in result:
+        return f"ERROR: {result['error']}"
+    return "Print cancelled successfully. Printer returning to idle state."
+
+
+# ── Tool: set_temperature ─────────────────────────────────────────────────────
+
+@mcp.tool()
+def set_temperature(target: str, temperature: int) -> str:
+    """
+    Set the temperature of the hotend or heated bed.
+
+    Args:
+        target:      "hotend" or "bed"
+        temperature: Target temperature in Celsius (0 to turn off)
+
+    Returns:
+        Confirmation of temperature change.
+    """
+    target_lower = target.lower().strip()
+    if target_lower not in ("hotend", "bed"):
+        return "Invalid target. Use 'hotend' or 'bed'."
+
+    if temperature < 0 or temperature > 300:
+        return f"Temperature {temperature}C is out of safe range (0-300C)."
+
+    if CONNECTION_MODE == "server":
+        if target_lower == "hotend":
+            result = _server_get("setExtruderTemperature",
+                                 data={"temperature": temperature, "extruder": 0})
+        else:
+            result = _server_get("setBedTemperature",
+                                 data={"temperature": temperature})
+        if "error" in result:
+            return f"ERROR: {result['error']}"
+        return f"{target_lower.title()} temperature set to {temperature}C."
+
+    # Serial mode
+    if target_lower == "hotend":
+        cmd = f"M104 S{temperature}"
+    else:
+        cmd = f"M140 S{temperature}"
+
+    lines = _send_gcode_serial(cmd, wait_lines=3)
+    return f"{target_lower.title()} temperature set to {temperature}C.\nResponse: {' '.join(lines)}"
 
 
 # ── Tool: diagnose_error ───────────────────────────────────────────────────────
@@ -674,28 +940,28 @@ def diagnose_error(error_text: str, printer_model: Optional[str] = None) -> str:
     diagnosis = _diagnose(error_text, model)
 
     lines = [
-        f"🔍 Diagnosis for: '{error_text}'",
+        f"Diagnosis for: '{error_text}'",
         f"   Printer: {model}",
         f"   Error type: {diagnosis['error_type']}",
         "",
-        "📋 Probable causes:",
+        "Probable causes:",
     ]
     for i, cause in enumerate(diagnosis.get("causes", []), 1):
         lines.append(f"   {i}. {cause}")
 
-    lines += ["", "🔧 Recommended fixes (in order):"]
+    lines += ["", "Recommended fixes (in order):"]
     for fix in diagnosis.get("fixes", []):
         lines.append(f"   {fix}")
 
     gcode_helpers = diagnosis.get("gcode_helpers", [])
     if gcode_helpers:
-        lines += ["", "📟 Useful G-code commands for this issue:"]
+        lines += ["", "Useful G-code commands for this issue:"]
         for gc in gcode_helpers:
             lines.append(f"   {gc}")
 
     lines += [
         "",
-        "💡 Tip: Run printer_status() before and after each fix to",
+        "Tip: Run printer_status() before and after each fix to",
         "   confirm the issue is resolved.",
     ]
     return "\n".join(lines)
@@ -709,11 +975,11 @@ def temperature_check(samples: int = 5, interval_seconds: float = 2.0) -> str:
     Take multiple temperature readings to check for stability.
 
     Useful for detecting intermittent thermal issues — a stable temperature
-    should vary less than ±2°C between readings.
+    should vary less than +/-2C between readings.
 
     Args:
-        samples:          Number of temperature readings to take (1–20).
-        interval_seconds: Seconds between readings (0.5–10).
+        samples:          Number of temperature readings to take (1-20).
+        interval_seconds: Seconds between readings (0.5-10).
 
     Returns:
         Table of hotend and bed temperatures with stability analysis.
@@ -722,31 +988,49 @@ def temperature_check(samples: int = 5, interval_seconds: float = 2.0) -> str:
     interval_seconds = max(0.5, min(10.0, interval_seconds))
 
     readings = []
-    for i in range(samples):
-        lines = _send_gcode_serial("M105", wait_lines=3)
-        timestamp = time.strftime("%H:%M:%S")
-        hotend, bed = None, None
-        for line in lines:
-            if "T:" in line:
-                try:
-                    parts = line.split()
-                    for part in parts:
-                        if part.startswith("T:"):
-                            hotend = float(part[2:].split("/")[0])
-                        elif part.startswith("B:"):
-                            bed = float(part[2:].split("/")[0])
-                except (ValueError, IndexError):
-                    pass
-        readings.append({"t": timestamp, "hotend": hotend, "bed": bed})
-        if i < samples - 1:
-            time.sleep(interval_seconds)
+
+    if CONNECTION_MODE == "server":
+        for i in range(samples):
+            timestamp = time.strftime("%H:%M:%S")
+            data = _server_get("stateList")
+            hotend, bed = None, None
+            if "error" not in data:
+                temp_data = data.get("temp", {})
+                extruders = temp_data.get("extruder", [])
+                if extruders:
+                    hotend = extruders[0].get("tempRead")
+                bed_data = temp_data.get("bed", {})
+                if bed_data:
+                    bed = bed_data.get("tempRead")
+            readings.append({"t": timestamp, "hotend": hotend, "bed": bed})
+            if i < samples - 1:
+                time.sleep(interval_seconds)
+    else:
+        for i in range(samples):
+            lines = _send_gcode_serial("M105", wait_lines=3)
+            timestamp = time.strftime("%H:%M:%S")
+            hotend, bed = None, None
+            for line in lines:
+                if "T:" in line:
+                    try:
+                        parts = line.split()
+                        for part in parts:
+                            if part.startswith("T:"):
+                                hotend = float(part[2:].split("/")[0])
+                            elif part.startswith("B:"):
+                                bed = float(part[2:].split("/")[0])
+                    except (ValueError, IndexError):
+                        pass
+            readings.append({"t": timestamp, "hotend": hotend, "bed": bed})
+            if i < samples - 1:
+                time.sleep(interval_seconds)
 
     # Analysis
     hotend_vals = [r["hotend"] for r in readings if r["hotend"] is not None]
     bed_vals    = [r["bed"]    for r in readings if r["bed"]    is not None]
 
     lines = [f"Temperature check — {samples} samples at {interval_seconds}s intervals", ""]
-    lines.append(f"{'Time':<10} {'Hotend (°C)':>12} {'Bed (°C)':>10}")
+    lines.append(f"{'Time':<10} {'Hotend (C)':>12} {'Bed (C)':>10}")
     lines.append("-" * 36)
     for r in readings:
         h = f"{r['hotend']:.1f}" if r["hotend"] is not None else "err"
@@ -756,15 +1040,15 @@ def temperature_check(samples: int = 5, interval_seconds: float = 2.0) -> str:
     lines.append("-" * 36)
     if hotend_vals:
         spread = max(hotend_vals) - min(hotend_vals)
-        status = "✅ Stable" if spread < 2 else "⚠️  UNSTABLE"
-        lines.append(f"Hotend spread: {spread:.1f}°C  {status}")
+        status = "STABLE" if spread < 2 else "UNSTABLE"
+        lines.append(f"Hotend spread: {spread:.1f}C  {status}")
     if bed_vals:
         spread = max(bed_vals) - min(bed_vals)
-        status = "✅ Stable" if spread < 1 else "⚠️  UNSTABLE"
-        lines.append(f"Bed spread   : {spread:.1f}°C  {status}")
+        status = "STABLE" if spread < 1 else "UNSTABLE"
+        lines.append(f"Bed spread   : {spread:.1f}C  {status}")
 
     if not hotend_vals:
-        lines.append("\n⚠️  Could not read temperatures. Check serial connection.")
+        lines.append("\nCould not read temperatures. Check connection.")
         lines.append("Run diagnose_error('communication error') for troubleshooting.")
 
     return "\n".join(lines)
@@ -775,15 +1059,34 @@ def temperature_check(samples: int = 5, interval_seconds: float = 2.0) -> str:
 @mcp.tool()
 def list_serial_ports() -> str:
     """
-    Scan and list all available serial ports on this computer.
-
-    Useful for finding the correct port when setting up the printer connection.
-    The Sidewinder X1 typically appears as /dev/ttyUSB0 (Linux),
-    /dev/cu.usbserial-* (macOS), or COM3–COM9 (Windows).
+    Scan and list all available serial ports on this computer,
+    or show server connection info when in server mode.
 
     Returns:
-        List of ports with device path, description and hardware ID.
+        List of ports with device path, description and hardware ID,
+        or server connection details.
     """
+    if CONNECTION_MODE == "server":
+        slug = PRINTER_SLUG or "(not set)"
+        lines = [
+            "Running in SERVER mode — serial ports not used.",
+            "",
+            f"  Server URL:    {SERVER_URL}",
+            f"  Printer slug:  {slug}",
+            f"  API key:       {'(set)' if SERVER_API_KEY else '(not set)'}",
+            "",
+            "Testing connection...",
+        ]
+        data = _server_get("stateList")
+        if "error" in data:
+            lines.append(f"  Connection FAILED: {data['error']}")
+        else:
+            state = data.get("state", -1)
+            state_map = {0: "idle", 1: "printing", 2: "paused", 3: "waiting"}
+            lines.append(f"  Connection OK — Printer state: {state_map.get(state, 'unknown')}")
+        return "\n".join(lines)
+
+    import serial.tools.list_ports
     ports = serial.tools.list_ports.comports()
     if not ports:
         return "No serial ports found. Is the printer connected via USB?"
@@ -795,7 +1098,7 @@ def list_serial_ports() -> str:
 
     detected = _auto_detect_port()
     if detected:
-        lines.append(f"\n🖨️  Auto-detected printer port: {detected}")
+        lines.append(f"\nAuto-detected printer port: {detected}")
         lines.append(f"   Set: REPETIER_PORT={detected}")
     return "\n".join(lines)
 
@@ -807,7 +1110,7 @@ def emergency_stop() -> str:
     """
     Send M112 emergency stop to the printer.
 
-    ⚠️  WARNING: This immediately halts all motion and turns off heaters.
+    WARNING: This immediately halts all motion and turns off heaters.
     Use only if there is a real safety risk (fire, crash, uncontrolled movement).
     The printer will need to be power-cycled and re-homed after an emergency stop.
 
@@ -815,12 +1118,11 @@ def emergency_stop() -> str:
         Confirmation that M112 was sent.
     """
     if CONNECTION_MODE == "server":
-        slug = PRINTER_SLUG or "default"
-        result = _server_get(f"/printer/send/{slug}", {"cmd": "M112"})
-        return f"⛔ Emergency stop sent to Repetier-Server.\n{json.dumps(result)}"
+        result = _server_get("send", data={"cmd": "M112"})
+        return f"EMERGENCY STOP sent to Repetier-Server.\n{json.dumps(result)}"
 
     lines = _send_gcode_serial("M112", wait_lines=2)
-    return "⛔ Emergency stop (M112) sent.\nPower-cycle the printer before resuming.\nResponse: " + " | ".join(lines)
+    return "EMERGENCY STOP (M112) sent.\nPower-cycle the printer before resuming.\nResponse: " + " | ".join(lines)
 
 
 # ── Tool: knowledge_base_summary ──────────────────────────────────────────────
@@ -834,13 +1136,13 @@ def knowledge_base_summary() -> str:
     so you know what to look for in Repetier-Host log messages.
     """
     lines = [
-        "📚 Diagnostic Knowledge Base",
+        "Diagnostic Knowledge Base",
         f"   Printer model: {PRINTER_MODEL}",
         "",
     ]
     all_errors = {**SIDEWINDER_X1_ERRORS, **GENERIC_ERRORS}
     for error_id, data in all_errors.items():
-        lines.append(f"🔴 {error_id}")
+        lines.append(f"  {error_id}")
         lines.append(f"   Symptoms: {', '.join(data['symptoms'])}")
         lines.append(f"   {len(data['causes'])} known cause(s) | {len(data['fixes'])} fix step(s)")
         lines.append("")
